@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import { CONFIG, CATEGORIAS, MENU, brl, loadMenu, saveMenu, clearMenu, novoId } from './data'
+import { CONFIG, CATEGORIAS, MENU, brl, loadMenu, saveMenu, clearMenu, novoId, supabaseEnabled, rowToItem, itemToRow } from './data'
+import { supabase } from './supabase'
 import logo from './assets/logo.png'
 
 /* ------------------------------- Ícones ------------------------------- */
@@ -34,6 +35,22 @@ export default function App() {
     const onHash = () => setRoute((window.location.hash || '').replace('#', ''))
     window.addEventListener('hashchange', onHash)
     return () => window.removeEventListener('hashchange', onHash)
+  }, [])
+
+  // Cardápio ao vivo do Supabase (com atualização em tempo real). Se não configurado, usa o local.
+  useEffect(() => {
+    if (!supabaseEnabled() || !supabase) return
+    let active = true
+    const fetchMenu = async () => {
+      const { data, error } = await supabase.from('produtos').select('*').order('ordem', { ascending: true })
+      if (!error && active && Array.isArray(data) && data.length) setMenu(data.map(rowToItem))
+    }
+    fetchMenu()
+    const ch = supabase
+      .channel('produtos-rt')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'produtos' }, fetchMenu)
+      .subscribe()
+    return () => { active = false; supabase.removeChannel(ch) }
   }, [])
 
   if (route === 'admin') {
@@ -522,18 +539,39 @@ function Checkout({ items, subtotal, notes, onClose, onAdd, onDec, onRemove, onN
 
 /* =============================== ADMIN =============================== */
 function Admin({ menu, setMenu, onExit }) {
+  const online = supabaseEnabled()
   const [ok, setOk] = useState(false)
-  const [login, setLogin] = useState('')
+  const [login, setLogin] = useState('') // offline: login | online: e-mail
   const [pw, setPw] = useState('')
-  const [err, setErr] = useState(false)
+  const [err, setErr] = useState('')
+  const [busy, setBusy] = useState(false)
   const [saved, setSaved] = useState('')
 
-  const entrar = (e) => {
+  const flash = (msg) => { setSaved(msg); setTimeout(() => setSaved(''), 2600) }
+
+  // Sessão já ativa no Supabase -> entra direto
+  useEffect(() => {
+    if (!online || !supabase) return
+    supabase.auth.getSession().then(({ data }) => { if (data && data.session) setOk(true) })
+  }, [online])
+
+  const entrar = async (e) => {
     e.preventDefault()
-    const loginOk = login.trim().toUpperCase() === String(CONFIG.adminLogin).toUpperCase()
-    if (loginOk && pw === CONFIG.adminSenha) { setOk(true); setErr(false) }
-    else setErr(true)
+    setErr('')
+    if (online) {
+      setBusy(true)
+      const { error } = await supabase.auth.signInWithPassword({ email: login.trim(), password: pw })
+      setBusy(false)
+      if (error) setErr('E-mail ou senha incorretos.')
+      else setOk(true)
+    } else {
+      const loginOk = login.trim().toUpperCase() === String(CONFIG.adminLogin).toUpperCase()
+      if (loginOk && pw === CONFIG.adminSenha) setOk(true)
+      else setErr('Login ou senha incorretos.')
+    }
   }
+
+  const sair = async () => { if (online && supabase) await supabase.auth.signOut(); setOk(false) }
 
   const upd = (id, patch) => setMenu((list) => list.map((m) => (m.id === id ? { ...m, ...patch } : m)))
   const del = (id) => setMenu((list) => list.filter((m) => m.id !== id))
@@ -543,8 +581,28 @@ function Admin({ menu, setMenu, onExit }) {
     setTimeout(() => { const el = document.getElementById('p-' + id); if (el) { el.scrollIntoView({ behavior: 'smooth', block: 'center' }); const inp = el.querySelector('input'); if (inp) inp.focus() } }, 60)
   }
 
-  const flash = (msg) => { setSaved(msg); setTimeout(() => setSaved(''), 2200) }
-  const salvar = () => flash(saveMenu(menu) ? '✓ Alterações salvas neste aparelho' : '⚠ Não foi possível salvar localmente (mas o download funciona)')
+  // Publicar: online -> grava no banco (ao vivo p/ todos); offline -> salva neste aparelho
+  const salvar = async () => {
+    if (!online) { flash(saveMenu(menu) ? '✓ Alterações salvas neste aparelho' : '⚠ Não foi possível salvar localmente (mas o download funciona)'); return }
+    setBusy(true)
+    try {
+      const rows = menu.map((m, i) => itemToRow(m, i))
+      const ids = rows.map((r) => r.id)
+      if (rows.length) {
+        const { error } = await supabase.from('produtos').upsert(rows, { onConflict: 'id' })
+        if (error) throw error
+      }
+      let delq = supabase.from('produtos').delete()
+      delq = ids.length
+        ? delq.not('id', 'in', '(' + ids.map((id) => '"' + id + '"').join(',') + ')')
+        : delq.neq('id', '__none__')
+      const { error: e2 } = await delq
+      if (e2) throw e2
+      flash('✓ Publicado ao vivo! Os clientes já veem as mudanças.')
+    } catch (er) {
+      flash('⚠ Erro ao publicar: ' + ((er && er.message) || 'tente novamente'))
+    } finally { setBusy(false) }
+  }
 
   const restaurar = () => {
     if (window.confirm('Restaurar o cardápio padrão? Suas edições locais serão apagadas.')) {
@@ -581,11 +639,16 @@ function Admin({ menu, setMenu, onExit }) {
         <motion.form className="gate-card" onSubmit={entrar} initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }}>
           <img src={logo} alt="Gordin" style={{ width: 150, margin: '0 auto 6px' }} />
           <h2>Painel de Administração</h2>
-          <p className="gate-sub">Acesso restrito ao dono da loja.</p>
-          <input type="text" value={login} autoFocus autoComplete="username" autoCapitalize="characters" onChange={(e) => { setLogin(e.target.value); setErr(false) }} placeholder="Login" />
-          <input type="password" value={pw} autoComplete="current-password" onChange={(e) => { setPw(e.target.value); setErr(false) }} placeholder="Senha" />
-          {err && <div className="gate-err">Login ou senha incorretos.</div>}
-          <button type="submit" className="btn-fire">Entrar</button>
+          <p className="gate-sub">{online ? 'Entre com seu e-mail e senha de administrador.' : 'Acesso restrito ao dono da loja.'}</p>
+          <input
+            type={online ? 'email' : 'text'} value={login} autoFocus
+            autoComplete={online ? 'email' : 'username'} autoCapitalize={online ? 'off' : 'characters'}
+            onChange={(e) => { setLogin(e.target.value); setErr('') }}
+            placeholder={online ? 'E-mail' : 'Login'}
+          />
+          <input type="password" value={pw} autoComplete="current-password" onChange={(e) => { setPw(e.target.value); setErr('') }} placeholder="Senha" />
+          {err && <div className="gate-err">{err}</div>}
+          <button type="submit" className="btn-fire" disabled={busy}>{busy ? 'Entrando…' : 'Entrar'}</button>
           <a href="#" onClick={onExit} className="gate-back">← Voltar ao cardápio</a>
         </motion.form>
       </div>
@@ -609,17 +672,23 @@ function Admin({ menu, setMenu, onExit }) {
 
       <div className="wrap">
         <div className="admin-actions">
-          <button className="btn-fire" onClick={salvar}>💾 Salvar</button>
-          <button className="btn-wa" onClick={baixar}>⬇ Baixar site para publicar</button>
-          <button className="btn-ghost" onClick={restaurar}>↺ Restaurar padrão</button>
+          <button className="btn-fire" onClick={salvar} disabled={busy}>{online ? (busy ? '⏳ Publicando…' : '🚀 Publicar ao vivo') : '💾 Salvar'}</button>
+          {!online && <button className="btn-wa" onClick={baixar}>⬇ Baixar site para publicar</button>}
+          {!online && <button className="btn-ghost" onClick={restaurar}>↺ Restaurar padrão</button>}
+          {online && <button className="btn-ghost" onClick={sair}>⎋ Sair</button>}
         </div>
         <AnimatePresence>
           {saved && <motion.div className="admin-flash" initial={{ opacity: 0, y: -6 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}>{saved}</motion.div>}
         </AnimatePresence>
 
         <div className="admin-note">
-          As mudanças aparecem na hora aqui e ficam salvas neste aparelho. Para os clientes verem,
-          clique em <b>Baixar site para publicar</b> e suba o arquivo no seu hospedeiro (Netlify).
+          {online ? (
+            <>Edite à vontade e clique em <b>Publicar ao vivo</b>. As mudanças vão para o banco de dados
+            e aparecem <b>na hora</b> para todos os clientes — sem baixar nem subir arquivo.</>
+          ) : (
+            <>As mudanças aparecem na hora aqui e ficam salvas neste aparelho. Para os clientes verem,
+            clique em <b>Baixar site para publicar</b> e suba o arquivo no seu hospedeiro.</>
+          )}
         </div>
 
         {CATEGORIAS.map((c) => {

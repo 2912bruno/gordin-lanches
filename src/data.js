@@ -19,6 +19,18 @@ export const CONFIG = {
   adminSenha: 'Julinha',
 }
 
+// ============================================================================
+//  SUPABASE — Admin ao vivo (opcional)
+//  Preencha url + anonKey para ativar o cardápio no banco de dados com login real
+//  e atualização em tempo real. Deixe em branco para usar o modo local (fallback).
+//  A anonKey é PÚBLICA por design (protegida por RLS) — pode ficar no código.
+// ============================================================================
+export const SUPABASE = {
+  url: '',      // ex.: https://xxxxxxxx.supabase.co
+  anonKey: '',  // ex.: eyJhbGciOi... (chave "anon public")
+}
+export const supabaseEnabled = () => !!(SUPABASE.url && SUPABASE.anonKey)
+
 // Categorias exibidas no menu de navegação (ordem importa)
 export const CATEGORIAS = [
   { id: 'lanches', nome: 'Lanches', icone: '🍔' },
@@ -89,4 +101,12 @@ export function clearMenu() {
 
 export function novoId() {
   return 'p' + Math.random().toString(36).slice(2, 8) + (Date.now() % 100000)
+}
+
+// Conversão entre linha do banco (Supabase) e item do app
+export function rowToItem(r) {
+  return { id: r.id, cat: r.cat, nome: r.nome, desc: r.descricao || '', preco: Number(r.preco) || 0, destaque: !!r.destaque }
+}
+export function itemToRow(m, ordem) {
+  return { id: m.id, cat: m.cat, nome: m.nome, descricao: m.desc || '', preco: Number(m.preco) || 0, destaque: !!m.destaque, ordem }
 }
